@@ -1,0 +1,18 @@
+# Input files used by the pipeline
+input.mp4
+input.srt
+flyer.txt
+
+# Generated audio and working artifacts
+_audio.wav
+blocks.json
+songs.json
+songs_review.md
+lyrics_by_song.md
+song_story_summary.json
+song_story_summary.md
+
+# Progress/checkpoint files
+enhanced_progress.json
+song_summary_progress.json
+continuity_notes.txt

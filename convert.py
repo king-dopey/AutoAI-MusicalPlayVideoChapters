@@ -23,7 +23,8 @@ External Dependencies:
 - numpy for numeric feature extraction.
 """
 
-import os, re, json, time, random, wave, subprocess, math
+import os, re, json, time, random, wave, subprocess, math, socket, logging
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from urllib import request, error
 
@@ -33,15 +34,44 @@ import numpy as np
 # Config
 # =========================
 BASE_URL = os.getenv("BASE_URL", "").rstrip("/")
-MODEL = os.getenv("MODEL", "qwen3.6:35b-a3b")
+MODEL = os.getenv("MODEL", "")
+MODEL_DETECT = os.getenv("MODEL_DETECT", MODEL or "qwen3-coder:30b")
+MODEL_EXTRACT = os.getenv("MODEL_EXTRACT", MODEL or "qwen3-coder:30b")
+MODEL_SUMMARY = os.getenv("MODEL_SUMMARY", MODEL or "qwen3.6:35b-a3b")
+MODEL_VERIFY = os.getenv("MODEL_VERIFY", MODEL or "nemotron-cascade-2:30b")
 API_KEY = os.getenv("API_KEY", "")
+KV_CACHE_TYPE = os.getenv("KV_CACHE_TYPE", "q8_0")
 
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.2"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "8"))
 BASE_SLEEP = float(os.getenv("BASE_SLEEP", "2.0"))
 MAX_SLEEP = float(os.getenv("MAX_SLEEP", "45.0"))
 ERR_BODY_CHARS = int(os.getenv("ERR_BODY_CHARS", "6000"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "180"))
+TASK_TIMEOUT = float(os.getenv("TASK_TIMEOUT", "1800"))
+MAX_PROMPT_TOKENS = int(os.getenv("MAX_PROMPT_TOKENS", "12000"))
+MIN_BOUNDARY_SHIFT_MS = int(os.getenv("MIN_BOUNDARY_SHIFT_MS", "1500"))
+MAX_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "1"))
 RESUME = os.getenv("RESUME", "1") == "1"
+ENABLE_VERIFIER = os.getenv("ENABLE_VERIFIER", "0") == "1"
+LOG_RAW_EMPTY = os.getenv("LOG_RAW_EMPTY", "0") == "1"
+EMPTY_REPAIR_MAX_STEPS = max(0, int(os.getenv("EMPTY_REPAIR_MAX_STEPS", "3")))
+NUM_PREDICT_HARD_CAP = max(1, int(os.getenv("NUM_PREDICT_HARD_CAP", "16384")))
+NUM_CTX_HARD_CAP = max(1, int(os.getenv("NUM_CTX_HARD_CAP", "32768")))
+EMPTY_REPAIR_SAFETY_MARGIN = 256
+THINK_DETECT = os.getenv("THINK_DETECT", "0") == "1"
+THINK_EXTRACT = os.getenv("THINK_EXTRACT", "0") == "1"
+THINK_SUMMARY = os.getenv("THINK_SUMMARY", "1") == "1"
+THINK_VERIFY = os.getenv("THINK_VERIFY", "1") == "1"
+
+NUM_CTX_DETECT = int(os.getenv("NUM_CTX_DETECT", "16384"))
+NUM_CTX_EXTRACT = int(os.getenv("NUM_CTX_EXTRACT", "16384"))
+NUM_CTX_SUMMARY = int(os.getenv("NUM_CTX_SUMMARY", "32768"))
+NUM_CTX_VERIFY = int(os.getenv("NUM_CTX_VERIFY", "16384"))
+NUM_PREDICT_DETECT = int(os.getenv("NUM_PREDICT_DETECT", "512"))
+NUM_PREDICT_EXTRACT = int(os.getenv("NUM_PREDICT_EXTRACT", "2048"))
+NUM_PREDICT_SUMMARY = int(os.getenv("NUM_PREDICT_SUMMARY", "8192"))
+NUM_PREDICT_VERIFY = int(os.getenv("NUM_PREDICT_VERIFY", "4096"))
 
 # Audio / segmentation
 AUDIO_SR = int(os.getenv("AUDIO_SR", "16000"))
@@ -59,6 +89,35 @@ SEARCH_STRIDE = int(os.getenv("SEARCH_STRIDE", "3"))
 BOUNDARY_CONTEXT_BLOCKS = int(os.getenv("BOUNDARY_CONTEXT_BLOCKS", "1"))
 LYRICS_WINDOW_CUES = int(os.getenv("LYRICS_WINDOW_CUES", "90"))
 LYRICS_WINDOW_OVERLAP = int(os.getenv("LYRICS_WINDOW_OVERLAP", "15"))
+
+RETRYABLE_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+
+
+class LLMTaskError(RuntimeError):
+    """Raised when an LLM task cannot be completed after retries."""
+
+
+class LLMResponseValidationError(LLMTaskError):
+    """Raised when a response fails schema or candidate validation."""
+
+
+class LLMTaskTimeoutError(LLMTaskError):
+    """Raised when a logical task exceeds its wall-clock budget."""
+
+
+class LLMTaskRetryExhaustedError(LLMTaskError):
+    """Raised when a task exhausts retries after transient failures."""
+
+
+class LLMEmptyResponseError(LLMTaskError):
+    """Raised when a 2xx response returns empty visible content."""
+
+    def __init__(self, message, *, raw_response_body=""):
+        super().__init__(message)
+        self.raw_response_body = raw_response_body
+
+
+TASK_BOUNDARY_NEIGHBORS = 2
 
 SYSTEM = """You are a careful musical-theatre transcript analyst.
 
@@ -123,7 +182,7 @@ def print_server_error_detail(status, hdrs, body, label):
     print((body or "")[:ERR_BODY_CHARS])
     print(f"--- END {label} ---\n")
 
-def http_post_json(url, payload, timeout=3600):
+def http_post_json(url, payload, timeout: float = 3600.0, headers=None):
     """Send a JSON POST request and return status, body, and headers.
 
     Args:
@@ -134,11 +193,13 @@ def http_post_json(url, payload, timeout=3600):
     Returns:
         A tuple of (status_code, response_text, response_headers).
     """
-    headers = {"Content-Type": "application/json"}
+    request_headers = {"Content-Type": "application/json"}
     if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
+        request_headers["Authorization"] = f"Bearer {API_KEY}"
+    if headers:
+        request_headers.update(headers)
     data = json.dumps(payload).encode("utf-8")
-    req = request.Request(url, data=data, headers=headers, method="POST")
+    req = request.Request(url, data=data, headers=request_headers, method="POST")
     try:
         with request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
@@ -151,62 +212,903 @@ def http_post_json(url, payload, timeout=3600):
             pass
         return e.code, body, dict(getattr(e, "headers", {}) or {})
 
-def chat_json(system_prompt, user_prompt):
-    """Call the chat-completions endpoint with system and user prompts.
 
-    Args:
-        system_prompt: System instruction text.
-        user_prompt: User prompt text.
+def estimate_prompt_tokens(text):
+    """Estimate prompt tokens using a cheap character heuristic."""
+    return max(1, int(math.ceil(len(text or "") / 4.0)))
 
-    Returns:
-        A tuple of (status_code, response_text, response_headers).
-    """
-    url = BASE_URL + "/chat/completions"
+
+def task_deadline(timeout_s=TASK_TIMEOUT):
+    """Return a monotonic deadline for a logical task."""
+    return time.monotonic() + max(1.0, float(timeout_s))
+
+
+def task_time_remaining(deadline):
+    """Return remaining seconds before a deadline, or 0 when expired."""
+    return max(0.0, deadline - time.monotonic())
+
+
+def parse_retry_after(headers):
+    """Parse Retry-After headers into a delay in seconds."""
+    if not headers:
+        return None
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if not raw:
+        return None
+    raw = str(raw).strip()
+    if raw.isdigit():
+        return float(raw)
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        return max(0.0, dt.timestamp() - time.time())
+    except Exception:
+        return None
+
+
+def is_retryable_status(status):
+    """Return True for HTTP status codes that should be retried."""
+    return status in RETRYABLE_STATUS_CODES
+
+
+def is_retryable_exception(exc):
+    """Return True when a transport exception should be retried."""
+    return isinstance(exc, (error.URLError, TimeoutError, socket.timeout, ConnectionError, OSError))
+
+
+def build_chat_payload(messages, temperature, top_p=None, response_format=None, model=None):
+    """Build an OpenAI-compatible chat/completions payload."""
     payload = {
-        "model": MODEL,
-        "temperature": TEMPERATURE,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        "model": model or MODEL,
+        "temperature": temperature,
+        "messages": messages,
     }
-    return http_post_json(url, payload)
+    if top_p is not None:
+        payload["top_p"] = top_p
+    if response_format is not None:
+        payload["response_format"] = response_format
+    return payload
 
-def llm_json(system_prompt, user_prompt):
-    """Request JSON from the LLM with retries and backoff.
 
-    Args:
-        system_prompt: System instruction text.
-        user_prompt: User prompt text.
+def extract_json_payload(text):
+    """Extract JSON text from a plain or fenced model reply."""
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("Empty model response")
+    try:
+        json.loads(text)
+        return text
+    except Exception:
+        pass
 
-    Returns:
-        Parsed JSON object produced by the model.
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S | re.I)
+    if fence:
+        candidate = fence.group(1).strip()
+        json.loads(candidate)
+        return candidate
 
-    Raises:
-        SystemExit: If all retry attempts fail.
-    """
-    last_err = None
-    for attempt in range(1, MAX_RETRIES + 1):
-        status, raw, hdrs = chat_json(system_prompt, user_prompt)
+    for opener, closer in (("{", "}"), ("[", "]")):
+        start = text.find(opener)
+        end = text.rfind(closer)
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            json.loads(candidate)
+            return candidate
+
+    raise ValueError("No parseable JSON found in model output")
+
+
+def validate_json_schema(value, schema, path="$"):
+    """Validate a JSON value against a minimal in-code schema subset."""
+    if "anyOf" in schema:
+        for option in schema["anyOf"]:
+            try:
+                validate_json_schema(value, option, path)
+                return
+            except Exception:
+                pass
+        raise LLMResponseValidationError(f"{path}: did not match any allowed schema option")
+
+    if "oneOf" in schema:
+        matches = 0
+        for option in schema["oneOf"]:
+            try:
+                validate_json_schema(value, option, path)
+                matches += 1
+            except Exception:
+                pass
+        if matches != 1:
+            raise LLMResponseValidationError(f"{path}: did not match exactly one allowed schema option")
+        return
+
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        for item_type in schema_type:
+            try:
+                validate_json_schema(value, {**schema, "type": item_type}, path)
+                return
+            except Exception:
+                pass
+        raise LLMResponseValidationError(f"{path}: did not match any allowed type")
+
+    if schema_type == "object":
+        if not isinstance(value, dict):
+            raise LLMResponseValidationError(f"{path}: expected object")
+        required = schema.get("required", [])
+        for key in required:
+            if key not in value:
+                raise LLMResponseValidationError(f"{path}: missing required key {key}")
+        properties = schema.get("properties", {})
+        for key, subschema in properties.items():
+            if key in value:
+                validate_json_schema(value[key], subschema, f"{path}.{key}")
+        if schema.get("additionalProperties") is False:
+            allowed = set(properties)
+            extras = [key for key in value if key not in allowed]
+            if extras:
+                raise LLMResponseValidationError(f"{path}: unexpected keys {extras}")
+    elif schema_type == "array":
+        if not isinstance(value, list):
+            raise LLMResponseValidationError(f"{path}: expected array")
+        item_schema = schema.get("items")
+        if item_schema:
+            for idx, item in enumerate(value):
+                validate_json_schema(item, item_schema, f"{path}[{idx}]")
+    elif schema_type == "string":
+        if not isinstance(value, str):
+            raise LLMResponseValidationError(f"{path}: expected string")
+        enum = schema.get("enum")
+        if enum and value not in enum:
+            raise LLMResponseValidationError(f"{path}: value {value!r} not in enum")
+        min_len = schema.get("minLength")
+        if min_len is not None and len(value) < min_len:
+            raise LLMResponseValidationError(f"{path}: string too short")
+    elif schema_type == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise LLMResponseValidationError(f"{path}: expected integer")
+        enum = schema.get("enum")
+        if enum and value not in enum:
+            raise LLMResponseValidationError(f"{path}: value {value!r} not in enum")
+        minimum = schema.get("minimum")
+        if minimum is not None and value < minimum:
+            raise LLMResponseValidationError(f"{path}: value below minimum")
+        maximum = schema.get("maximum")
+        if maximum is not None and value > maximum:
+            raise LLMResponseValidationError(f"{path}: value above maximum")
+    elif schema_type == "number":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise LLMResponseValidationError(f"{path}: expected number")
+        minimum = schema.get("minimum")
+        if minimum is not None and value < minimum:
+            raise LLMResponseValidationError(f"{path}: value below minimum")
+        maximum = schema.get("maximum")
+        if maximum is not None and value > maximum:
+            raise LLMResponseValidationError(f"{path}: value above maximum")
+    elif schema_type == "boolean":
+        if not isinstance(value, bool):
+            raise LLMResponseValidationError(f"{path}: expected boolean")
+    elif schema_type == "null":
+        if value is not None:
+            raise LLMResponseValidationError(f"{path}: expected null")
+
+
+def schema_text(schema):
+    """Render a schema compactly for repair prompts."""
+    return json.dumps(schema, ensure_ascii=False, indent=2)
+
+
+def build_repair_prompt(schema, original_prompt):
+    """Create a concise repair prompt for invalid JSON responses."""
+    return (
+        "your previous response did not match the schema; return only valid JSON matching: "
+        f"{schema_text(schema)}\n\nOriginal task:\n{original_prompt}"
+    )
+
+
+def build_empty_response_repair_prompt(schema, original_prompt):
+    """Create a no-think JSON-only prompt for empty-response repair."""
+    if schema is not None:
+        prefix = "Respond with JSON ONLY. Do NOT think. Do NOT explain. Output must match this schema: "
+        prefix += schema_text(schema)
+    else:
+        prefix = "Respond with JSON ONLY. Do NOT think. Do NOT explain."
+    return f"{prefix}\n\n{original_prompt}"
+
+
+def strict_json_response_format(schema):
+    """Return a JSON schema response-format payload for compatible endpoints."""
+    return {"type": "json_schema", "json_schema": schema}
+
+
+def safe_response_format():
+    """Compatibility shim for the legacy helper."""
+    return {"type": "json_object"}
+
+
+def task_llm_settings(task):
+    """Return request settings for a task tier."""
+    if task == "detect":
+        return {
+            "phase": "detect",
+            "model": MODEL_DETECT,
+            "think": THINK_DETECT,
+            "num_ctx": NUM_CTX_DETECT,
+            "num_predict": NUM_PREDICT_DETECT,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repeat_penalty": 1.0,
+            "keep_alive": -1,
+            "strict_json": True,
+        }
+    if task == "extract":
+        return {
+            "phase": "extract",
+            "model": MODEL_EXTRACT,
+            "think": THINK_EXTRACT,
+            "num_ctx": NUM_CTX_EXTRACT,
+            "num_predict": NUM_PREDICT_EXTRACT,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repeat_penalty": 1.0,
+            "keep_alive": -1,
+            "strict_json": True,
+        }
+    if task == "summary":
+        return {
+            "phase": "summary",
+            "model": MODEL_SUMMARY,
+            "think": THINK_SUMMARY,
+            "num_ctx": NUM_CTX_SUMMARY,
+            "num_predict": NUM_PREDICT_SUMMARY,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repeat_penalty": 1.0,
+            "keep_alive": -1,
+            "strict_json": False,
+        }
+    if task == "verify":
+        return {
+            "phase": "verify",
+            "model": MODEL_VERIFY,
+            "think": THINK_VERIFY,
+            "num_ctx": NUM_CTX_VERIFY,
+            "num_predict": NUM_PREDICT_VERIFY,
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repeat_penalty": 1.0,
+            "keep_alive": "10m",
+            "strict_json": True,
+        }
+    raise ValueError(f"Unknown LLM task tier: {task}")
+
+
+def prompt_with_schema(schema, prompt):
+    """Wrap a prompt for strict JSON tasks with schema instructions."""
+    return (
+        "Respond with JSON only matching this schema.\n"
+        f"Schema:\n{schema_text(schema)}\n\n"
+        f"{prompt}"
+    )
+
+
+def build_llm_payload(messages, settings, schema=None, *, num_ctx=None, num_predict=None):
+    """Build a request payload for a task-tier LLM call."""
+    payload = {
+        "model": settings["model"],
+        "messages": messages,
+        "temperature": settings["temperature"],
+        "top_p": settings["top_p"],
+        "options": {
+            "num_ctx": num_ctx if num_ctx is not None else settings["num_ctx"],
+            "num_predict": num_predict if num_predict is not None else settings["num_predict"],
+            "cache_type_k": KV_CACHE_TYPE,
+            "cache_type_v": KV_CACHE_TYPE,
+            "num_keep": 256,
+            "top_k": settings["top_k"],
+            "min_p": settings["min_p"],
+            "presence_penalty": settings["presence_penalty"],
+            "repeat_penalty": settings["repeat_penalty"],
+        },
+        "keep_alive": settings["keep_alive"],
+    }
+    if schema is not None:
+        payload["response_format"] = strict_json_response_format(schema)
+        payload["format"] = schema
+    return payload
+
+
+def clamp_empty_response_budget(num_ctx, num_predict, prompt_tokens_est):
+    """Keep repair-call budgets within the configured context ceilings."""
+    num_ctx = max(1, int(num_ctx))
+    num_predict = max(1, int(num_predict))
+    prompt_tokens_est = int(prompt_tokens_est)
+    needed_ctx = num_predict + prompt_tokens_est + EMPTY_REPAIR_SAFETY_MARGIN
+    if num_ctx < needed_ctx:
+        num_ctx = min(max(num_ctx, needed_ctx), NUM_CTX_HARD_CAP)
+    if num_ctx < needed_ctx:
+        num_predict = max(1, num_ctx - prompt_tokens_est - EMPTY_REPAIR_SAFETY_MARGIN)
+    return num_ctx, num_predict
+
+
+def empty_response_details(raw):
+    """Extract visible content and optional reasoning fields from a model response."""
+    data = json.loads(raw)
+    choices = data.get("choices") or []
+    first_choice = choices[0] if choices else {}
+    message = first_choice.get("message") or {}
+    content = message.get("content") or ""
+    reasoning = message.get("reasoning")
+    if reasoning is None:
+        reasoning = message.get("thinking")
+    finish_reason = first_choice.get("finish_reason")
+    has_reasoning_field = "reasoning" in message or "thinking" in message
+    reasoning_chars = len(reasoning or "")
+    return data, content, finish_reason, has_reasoning_field, reasoning_chars
+
+
+def log_empty_response_warning(record):
+    """Emit a WARNING-level structured log for empty visible content."""
+    logging.warning(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+
+
+def log_empty_response_error(record):
+    """Emit an ERROR-level structured log for an exhausted empty-response repair."""
+    logging.error(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+
+
+def log_llm_call(record):
+    """Emit a structured single-line call log."""
+    print(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+
+
+def prompt_chars_for(prompt):
+    """Return a prompt length used for logging."""
+    return len(prompt or "")
+
+
+def llm_chat_json(task, call_name, system_prompt, user_prompt, schema, *, task_deadline, candidate_validator=None, prompt_builder=None, call_state=None, num_predict_override=None, expect_json=True):
+    """Call the chat endpoint with retries, schema validation, and repair."""
+    settings = task_llm_settings(task)
+    state = dict(call_state or {})
+    state.setdefault("num_ctx", settings["num_ctx"])
+    state.setdefault("window_size", None)
+    prompt_builder = prompt_builder or (lambda _state: user_prompt)
+    base_num_predict = num_predict_override if num_predict_override is not None else settings["num_predict"]
+    retries = 0
+    shrinks_applied = 0
+    consecutive_5xx = 0
+    last_error = None
+    last_status = None
+    last_latency_ms = None
+
+    def issue_request(prompt_text, *, num_ctx_used, num_predict_used, think_used, schema_prompt=True):
+        request_prompt = prompt_text
+        if settings["strict_json"] and expect_json and schema_prompt:
+            request_prompt = prompt_with_schema(schema, request_prompt)
+        request_chars = prompt_chars_for(request_prompt)
+        payload = build_llm_payload(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": request_prompt},
+            ],
+            settings,
+            schema=schema if settings["strict_json"] and expect_json else None,
+            num_ctx=num_ctx_used,
+            num_predict=num_predict_used,
+        )
+        headers = {"X-Ollama-Think": "true" if think_used else "false"}
+        request_timeout = min(REQUEST_TIMEOUT, max(1.0, task_time_remaining(task_deadline)))
+        request_started = time.monotonic()
+        status, raw, hdrs = http_post_json(BASE_URL + "/chat/completions", payload, timeout=request_timeout, headers=headers)
+        latency_ms = int((time.monotonic() - request_started) * 1000)
+        return {
+            "status": status,
+            "raw": raw,
+            "hdrs": hdrs,
+            "latency_ms": latency_ms,
+            "prompt_chars": request_chars,
+            "request_prompt": request_prompt,
+            "num_ctx_used": num_ctx_used,
+            "num_predict_used": num_predict_used,
+            "think_used": think_used,
+        }
+
+    def repair_empty_response(original_prompt, original_num_ctx, original_num_predict, original_think, initial_raw):
+        if EMPTY_REPAIR_MAX_STEPS <= 0:
+            if LOG_RAW_EMPTY:
+                log_empty_response_error({
+                    "phase": settings["phase"],
+                    "task": call_name,
+                    "model": settings["model"],
+                    "outcome": "empty_content_raw",
+                    "repair_step": 0,
+                    "raw_response_chars": len(initial_raw or ""),
+                    "raw_response_body": (initial_raw or "")[:1000],
+                })
+            raise LLMEmptyResponseError(f"{call_name} failed with empty model response", raw_response_body=initial_raw or "")
+
+        repair_num_ctx = original_num_ctx
+        repair_num_predict = original_num_predict
+        last_empty_raw = initial_raw or ""
+
+        for repair_step in range(1, EMPTY_REPAIR_MAX_STEPS + 1):
+            repair_num_predict = min(max(1, repair_num_predict * 2), NUM_PREDICT_HARD_CAP)
+            if repair_step == 1:
+                repair_think = original_think
+                repair_prompt = original_prompt
+                schema_prompt = True
+            elif repair_step == 2:
+                repair_think = False
+                repair_prompt = original_prompt
+                schema_prompt = True
+            else:
+                repair_think = False
+                repair_prompt = build_empty_response_repair_prompt(schema, original_prompt)
+                schema_prompt = False
+
+            prompt_for_budget = repair_prompt
+            if settings["strict_json"] and expect_json and schema_prompt:
+                prompt_for_budget = prompt_with_schema(schema, repair_prompt)
+            prompt_tokens_est = estimate_prompt_tokens(prompt_for_budget)
+            repair_num_ctx, repair_num_predict = clamp_empty_response_budget(repair_num_ctx, repair_num_predict, prompt_tokens_est)
+
+            issue = issue_request(
+                repair_prompt,
+                num_ctx_used=repair_num_ctx,
+                num_predict_used=repair_num_predict,
+                think_used=repair_think,
+                schema_prompt=schema_prompt,
+            )
+            status = issue["status"]
+            raw = issue["raw"]
+            hdrs = issue["hdrs"]
+            last_latency_ms = issue["latency_ms"]
+
+            if not (200 <= status < 300):
+                print_server_error_detail(status, hdrs, raw, f"SERVER ERROR DETAIL ({call_name} empty-response repair step {repair_step})")
+                raise LLMTaskError(f"{call_name} empty-response repair step {repair_step} failed with HTTP {status}")
+
+            try:
+                _, content, finish_reason, has_reasoning_field, reasoning_chars = empty_response_details(raw)
+            except Exception:
+                raise
+
+            if not str(content).strip():
+                last_empty_raw = raw or ""
+                log_empty_response_warning({
+                    "phase": settings["phase"],
+                    "task": call_name,
+                    "model": settings["model"],
+                    "think": repair_think,
+                    "outcome": "empty_content",
+                    "repair_step": repair_step,
+                    "num_ctx_used": issue["num_ctx_used"],
+                    "num_predict_used": issue["num_predict_used"],
+                    "finish_reason": finish_reason,
+                    "has_reasoning_field": has_reasoning_field,
+                    "reasoning_chars": reasoning_chars,
+                    "prompt_chars": issue["prompt_chars"],
+                    "latency_ms": last_latency_ms,
+                    "http_status": status,
+                    "retries": retries,
+                    "shrinks_applied": shrinks_applied,
+                })
+                repair_num_ctx = issue["num_ctx_used"]
+                repair_num_predict = issue["num_predict_used"]
+                if repair_step >= EMPTY_REPAIR_MAX_STEPS:
+                    if LOG_RAW_EMPTY:
+                        log_empty_response_error({
+                            "phase": settings["phase"],
+                            "task": call_name,
+                            "model": settings["model"],
+                            "outcome": "empty_content_raw",
+                            "repair_step": repair_step,
+                            "raw_response_chars": len(last_empty_raw),
+                            "raw_response_body": last_empty_raw[:1000],
+                        })
+                    raise LLMEmptyResponseError(f"{call_name} failed after {EMPTY_REPAIR_MAX_STEPS} empty-response repairs", raw_response_body=last_empty_raw)
+                continue
+
+            return issue
+
+        if LOG_RAW_EMPTY:
+            log_empty_response_error({
+                "phase": settings["phase"],
+                "task": call_name,
+                "model": settings["model"],
+                "outcome": "empty_content_raw",
+                "repair_step": EMPTY_REPAIR_MAX_STEPS,
+                "raw_response_chars": len(last_empty_raw),
+                "raw_response_body": last_empty_raw[:1000],
+            })
+        raise LLMEmptyResponseError(f"{call_name} failed with empty model response", raw_response_body=last_empty_raw)
+
+    while True:
+        if retries >= MAX_RETRIES:
+            break
+
+        if task_time_remaining(task_deadline) <= 0:
+            raise LLMTaskTimeoutError(f"{call_name} exceeded TASK_TIMEOUT")
+
+        prompt = prompt_builder(state)
+        if settings["strict_json"] and expect_json:
+            prompt = prompt_with_schema(schema, prompt)
+        request_chars = prompt_chars_for(prompt)
+        payload = build_llm_payload(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": prompt},
+            ],
+            settings,
+            schema=schema if settings["strict_json"] and expect_json else None,
+            num_ctx=state.get("num_ctx", settings["num_ctx"]),
+            num_predict=base_num_predict,
+        )
+
+        headers = {"X-Ollama-Think": "true" if settings["think"] else "false"}
+        request_timeout = min(REQUEST_TIMEOUT, max(1.0, task_time_remaining(task_deadline)))
+        request_started = time.monotonic()
+
+        try:
+            status, raw, hdrs = http_post_json(BASE_URL + "/chat/completions", payload, timeout=request_timeout, headers=headers)
+            last_latency_ms = int((time.monotonic() - request_started) * 1000)
+            last_status = status
+            if 500 <= status <= 599:
+                consecutive_5xx += 1
+            else:
+                consecutive_5xx = 0
+        except Exception as exc:
+            last_latency_ms = int((time.monotonic() - request_started) * 1000)
+            last_status = "transport_error"
+            last_error = repr(exc)
+            if not is_retryable_exception(exc):
+                log_llm_call({
+                    "phase": settings["phase"],
+                    "task": call_name,
+                    "model": settings["model"],
+                    "think": settings["think"],
+                    "num_ctx": state.get("num_ctx", settings["num_ctx"]),
+                    "prompt_chars": request_chars,
+                    "latency_ms": last_latency_ms,
+                    "http_status": last_status,
+                    "retries": retries,
+                    "shrinks_applied": shrinks_applied,
+                })
+                raise
+            retries += 1
+            sleep_cap = min(MAX_SLEEP, BASE_SLEEP * (2 ** retries))
+            time.sleep(random.uniform(0.0, sleep_cap))
+            continue
+
+        if is_retryable_status(status):
+            print_server_error_detail(status, hdrs, raw, f"SERVER ERROR DETAIL ({call_name})")
+            last_error = f"HTTP {status}"
+            retries += 1
+            retry_after = parse_retry_after(hdrs)
+            if 500 <= status <= 599:
+                consecutive_5xx += 1
+            else:
+                consecutive_5xx = 0
+            if consecutive_5xx >= 2:
+                old_ctx = int(state.get("num_ctx", settings["num_ctx"]))
+                new_ctx = max(1024, old_ctx // 2)
+                state["num_ctx"] = new_ctx
+                shrink_bits = [f"num_ctx {old_ctx}->{new_ctx}"]
+                if task in {"detect", "extract"} and state.get("window_size"):
+                    old_window = int(state["window_size"])
+                    new_window = max(1, old_window // 2)
+                    state["window_size"] = new_window
+                    shrink_bits.append(f"window_size {old_window}->{new_window}")
+                shrinks_applied += 1
+                print(f"LLM shrink task={call_name} {' '.join(shrink_bits)}")
+                consecutive_5xx = 0
+            if retries >= MAX_RETRIES:
+                break
+            sleep_cap = min(MAX_SLEEP, BASE_SLEEP * (2 ** retries))
+            sleep_s = retry_after if retry_after is not None else random.uniform(0.0, sleep_cap)
+            time.sleep(sleep_s)
+            continue
 
         if status < 200 or status >= 300:
-            print_server_error_detail(status, hdrs, raw, "SERVER ERROR DETAIL (non-2xx)")
-            last_err = f"HTTP {status}"
-        else:
-            try:
-                data = json.loads(raw)
-                content = data["choices"][0]["message"]["content"]
-                return parse_json_from_text(content)
-            except Exception as e:
-                print_server_error_detail(status, hdrs, raw, "BAD JSON FROM SERVER (2xx but not parseable)")
-                last_err = repr(e)
+            print_server_error_detail(status, hdrs, raw, f"SERVER ERROR DETAIL ({call_name})")
+            log_llm_call({
+                "phase": settings["phase"],
+                "task": call_name,
+                "model": settings["model"],
+                "think": settings["think"],
+                "num_ctx": state.get("num_ctx", settings["num_ctx"]),
+                "prompt_chars": request_chars,
+                "latency_ms": last_latency_ms,
+                "http_status": status,
+                "retries": retries,
+                "shrinks_applied": shrinks_applied,
+            })
+            raise LLMTaskError(f"{call_name} failed with HTTP {status}")
 
-        sleep_s = min(MAX_SLEEP, BASE_SLEEP * (2 ** (attempt - 1)) + random.random())
-        print(f"LLM attempt {attempt} failed: {last_err}")
+        try:
+            data = json.loads(raw)
+            choices = data.get("choices") or []
+            first_choice = choices[0] if choices else {}
+            message = first_choice.get("message") or {}
+            content = message.get("content") or ""
+            if not str(content).strip():
+                log_empty_response_warning({
+                    "phase": settings["phase"],
+                    "task": call_name,
+                    "model": settings["model"],
+                    "think": settings["think"],
+                    "outcome": "empty_content",
+                    "repair_step": 0,
+                    "num_ctx_used": state.get("num_ctx", settings["num_ctx"]),
+                    "num_predict_used": base_num_predict,
+                    "finish_reason": first_choice.get("finish_reason"),
+                    "has_reasoning_field": "reasoning" in message or "thinking" in message,
+                    "reasoning_chars": len((message.get("reasoning") if message.get("reasoning") is not None else message.get("thinking")) or ""),
+                    "prompt_chars": request_chars,
+                    "latency_ms": last_latency_ms,
+                    "http_status": status,
+                    "retries": retries,
+                    "shrinks_applied": shrinks_applied,
+                })
+                repair_response = repair_empty_response(
+                    prompt,
+                    state.get("num_ctx", settings["num_ctx"]),
+                    base_num_predict,
+                    settings["think"],
+                    raw,
+                )
+                status = repair_response["status"]
+                raw = repair_response["raw"]
+                hdrs = repair_response["hdrs"]
+                last_latency_ms = repair_response["latency_ms"]
+                request_chars = repair_response["prompt_chars"]
+                data = json.loads(raw)
+                choices = data.get("choices") or []
+                first_choice = choices[0] if choices else {}
+                message = first_choice.get("message") or {}
+                content = message.get("content") or ""
+            if not expect_json:
+                log_llm_call({
+                    "phase": settings["phase"],
+                    "task": call_name,
+                    "model": settings["model"],
+                    "think": settings["think"],
+                    "num_ctx": state.get("num_ctx", settings["num_ctx"]),
+                    "prompt_chars": request_chars,
+                    "latency_ms": last_latency_ms,
+                    "http_status": status,
+                    "retries": retries,
+                    "shrinks_applied": shrinks_applied,
+                })
+                return content
+            payload_text = extract_json_payload(content)
+            value = json.loads(payload_text)
+            validate_json_schema(value, schema)
+            if candidate_validator is not None:
+                candidate_validator(value)
+            log_llm_call({
+                "phase": settings["phase"],
+                "task": call_name,
+                "model": settings["model"],
+                "think": settings["think"],
+                "num_ctx": state.get("num_ctx", settings["num_ctx"]),
+                "prompt_chars": request_chars,
+                "latency_ms": last_latency_ms,
+                "http_status": status,
+                "retries": retries,
+                "shrinks_applied": shrinks_applied,
+            })
+            return value
+        except LLMEmptyResponseError:
+            raise
+        except Exception as exc:
+            last_error = repr(exc)
+            repair_prompt = build_repair_prompt(schema, prompt)
+            repair_payload = build_llm_payload(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                settings,
+                schema=schema if settings["strict_json"] and expect_json else None,
+                num_ctx=state.get("num_ctx", settings["num_ctx"]),
+                num_predict=base_num_predict,
+            )
+            repair_started = time.monotonic()
+            try:
+                repair_status, repair_raw, repair_hdrs = http_post_json(BASE_URL + "/chat/completions", repair_payload, timeout=request_timeout, headers=headers)
+                last_latency_ms = int((time.monotonic() - repair_started) * 1000)
+                last_status = repair_status
+                if 500 <= repair_status <= 599:
+                    consecutive_5xx += 1
+                else:
+                    consecutive_5xx = 0
+                if 200 <= repair_status < 300:
+                    repair_data = json.loads(repair_raw)
+                    repair_content = repair_data["choices"][0]["message"]["content"]
+                    payload_text = extract_json_payload(repair_content)
+                    value = json.loads(payload_text)
+                    validate_json_schema(value, schema)
+                    if candidate_validator is not None:
+                        candidate_validator(value)
+                    log_llm_call({
+                        "phase": settings["phase"],
+                        "task": call_name,
+                        "model": settings["model"],
+                        "think": settings["think"],
+                        "num_ctx": state.get("num_ctx", settings["num_ctx"]),
+                        "prompt_chars": request_chars,
+                        "latency_ms": last_latency_ms,
+                        "http_status": repair_status,
+                        "retries": retries,
+                        "shrinks_applied": shrinks_applied,
+                    })
+                    return value
+                print_server_error_detail(repair_status, repair_hdrs, repair_raw, f"SERVER ERROR DETAIL ({call_name} repair)")
+                last_error = f"HTTP {repair_status}"
+            except Exception as repair_exc:
+                last_error = repr(repair_exc)
+
+        retries += 1
+        if consecutive_5xx >= 2:
+            old_ctx = int(state.get("num_ctx", settings["num_ctx"]))
+            new_ctx = max(1024, old_ctx // 2)
+            state["num_ctx"] = new_ctx
+            shrink_bits = [f"num_ctx {old_ctx}->{new_ctx}"]
+            if task in {"detect", "extract"} and state.get("window_size"):
+                old_window = int(state["window_size"])
+                new_window = max(1, old_window // 2)
+                state["window_size"] = new_window
+                shrink_bits.append(f"window_size {old_window}->{new_window}")
+            shrinks_applied += 1
+            print(f"LLM shrink task={call_name} {' '.join(shrink_bits)}")
+            consecutive_5xx = 0
+        if retries >= MAX_RETRIES:
+            break
+        sleep_cap = min(MAX_SLEEP, BASE_SLEEP * (2 ** retries))
+        time.sleep(random.uniform(0.0, sleep_cap))
+
+    log_llm_call({
+        "phase": settings["phase"],
+        "task": call_name,
+        "model": settings["model"],
+        "think": settings["think"],
+        "num_ctx": state.get("num_ctx", settings["num_ctx"]),
+        "prompt_chars": request_chars,
+        "latency_ms": last_latency_ms,
+        "http_status": last_status,
+        "retries": retries,
+        "shrinks_applied": shrinks_applied,
+    })
+    raise LLMTaskRetryExhaustedError(f"{call_name} failed after {MAX_RETRIES} retries. Last error: {last_error}")
+
+
+def llm_chat_json_legacy(task_name, system_prompt, user_prompt, schema, *, temperature, top_p, task_deadline, candidate_validator=None, response_format=True):
+    """Call the chat endpoint with retries, schema validation, and repair."""
+    prompt_text = system_prompt + "\n" + user_prompt
+    prompt_tokens_est = estimate_prompt_tokens(prompt_text)
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        if task_time_remaining(task_deadline) <= 0:
+            raise LLMTaskTimeoutError(f"{task_name} exceeded TASK_TIMEOUT")
+
+        request_timeout = min(REQUEST_TIMEOUT, max(1.0, task_time_remaining(task_deadline)))
+        payload = build_chat_payload(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=temperature,
+            top_p=top_p,
+            response_format=safe_response_format() if response_format else None,
+        )
+
+        request_started = time.monotonic()
+        try:
+            status, raw, hdrs = http_post_json(BASE_URL + "/chat/completions", payload, timeout=request_timeout)
+            latency_ms = int((time.monotonic() - request_started) * 1000)
+            print(f"LLM task={task_name} attempt={attempt} prompt_tokens_est={prompt_tokens_est} status={status} latency_ms={latency_ms}")
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - request_started) * 1000)
+            print(f"LLM task={task_name} attempt={attempt} prompt_tokens_est={prompt_tokens_est} status=transport_error latency_ms={latency_ms}")
+            if is_retryable_exception(exc):
+                last_error = repr(exc)
+                sleep_cap = min(MAX_SLEEP, BASE_SLEEP * (2 ** attempt))
+                sleep_s = random.uniform(0.0, sleep_cap)
+                print(f"LLM task={task_name} retryable transport error: {last_error}")
+                print(f"Sleeping {sleep_s:.1f}s...")
+                time.sleep(sleep_s)
+                continue
+            raise
+
+        if is_retryable_status(status):
+            print_server_error_detail(status, hdrs, raw, f"SERVER ERROR DETAIL ({task_name})")
+            last_error = f"HTTP {status}"
+            retry_after = parse_retry_after(hdrs)
+            sleep_cap = min(MAX_SLEEP, BASE_SLEEP * (2 ** attempt))
+            sleep_s = retry_after if retry_after is not None else random.uniform(0.0, sleep_cap)
+            print(f"LLM task={task_name} retryable HTTP status={status} latency_ms={latency_ms}")
+            print(f"Sleeping {sleep_s:.1f}s...")
+            time.sleep(sleep_s)
+            continue
+
+        if status < 200 or status >= 300:
+            print_server_error_detail(status, hdrs, raw, f"SERVER ERROR DETAIL ({task_name})")
+            raise LLMTaskError(f"{task_name} failed with HTTP {status}")
+
+        try:
+            data = json.loads(raw)
+            content = data["choices"][0]["message"]["content"]
+            payload_text = extract_json_payload(content)
+            value = json.loads(payload_text)
+            validate_json_schema(value, schema)
+            if candidate_validator is not None:
+                candidate_validator(value)
+            return value
+        except Exception as exc:
+            last_error = repr(exc)
+            repair_prompt = build_repair_prompt(schema, user_prompt)
+            repair_payload = build_chat_payload(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": repair_prompt},
+                ],
+                temperature=temperature,
+                top_p=top_p,
+                response_format=safe_response_format() if response_format else None,
+            )
+            repair_started = time.monotonic()
+            try:
+                repair_status, repair_raw, repair_hdrs = http_post_json(BASE_URL + "/chat/completions", repair_payload, timeout=request_timeout)
+                repair_latency_ms = int((time.monotonic() - repair_started) * 1000)
+                print(f"LLM task={task_name} attempt={attempt}.repair prompt_tokens_est={prompt_tokens_est} status={repair_status} latency_ms={repair_latency_ms}")
+                if 200 <= repair_status < 300:
+                    repair_data = json.loads(repair_raw)
+                    repair_content = repair_data["choices"][0]["message"]["content"]
+                    payload_text = extract_json_payload(repair_content)
+                    value = json.loads(payload_text)
+                    validate_json_schema(value, schema)
+                    if candidate_validator is not None:
+                        candidate_validator(value)
+                    return value
+                if is_retryable_status(repair_status):
+                    print_server_error_detail(repair_status, repair_hdrs, repair_raw, f"SERVER ERROR DETAIL ({task_name} repair)")
+                else:
+                    print_server_error_detail(repair_status, repair_hdrs, repair_raw, f"SERVER ERROR DETAIL ({task_name} repair)")
+                last_error = f"HTTP {repair_status}"
+            except Exception as repair_exc:
+                last_error = repr(repair_exc)
+
+        sleep_cap = min(MAX_SLEEP, BASE_SLEEP * (2 ** attempt))
+        sleep_s = random.uniform(0.0, sleep_cap)
+        print(f"LLM task={task_name} attempt={attempt} failed: {last_error}")
         print(f"Sleeping {sleep_s:.1f}s...")
         time.sleep(sleep_s)
 
-    raise SystemExit(f"LLM failed after {MAX_RETRIES} retries. Last error: {last_err}")
+    raise LLMTaskError(f"{task_name} failed after {MAX_RETRIES} retries. Last error: {last_error}")
+
+
+def chat_json(system_prompt, user_prompt):
+    """Compatibility wrapper for callers that still expect a raw JSON HTTP call."""
+    payload = build_chat_payload([
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ], temperature=TEMPERATURE)
+    return http_post_json(BASE_URL + "/chat/completions", payload, timeout=REQUEST_TIMEOUT)
 
 # =========================
 # JSON helpers
@@ -229,10 +1131,9 @@ def parse_json_from_text(text):
     except Exception:
         pass
 
-    # Accept fenced JSON first because model replies may include markdown.
-    m = re.search(r"```json\s*(\\{.*?\\}|$$.*?$$)\s*```", text, re.S)
-    if m:
-        return json.loads(m.group(1))
+    fence = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S | re.I)
+    if fence:
+        return json.loads(fence.group(1).strip())
 
     m = re.search(r"(\{.*\}|\[.*\])", text, re.S)
     if m:
@@ -386,6 +1287,19 @@ def downgrade_confidence(c):
         return "medium"
     if c == "medium":
         return "low"
+    return "low"
+
+
+def confidence_score_to_label(score):
+    """Map a numeric confidence score to the existing low/medium/high labels."""
+    try:
+        score = float(score)
+    except Exception:
+        return "low"
+    if score >= 0.85:
+        return "high"
+    if score >= 0.55:
+        return "medium"
     return "low"
 
 # =========================
@@ -1038,6 +1952,203 @@ def song_list_text(songs):
     """
     return "\n".join([f'{s["index"]}. Act {s["act"]} - {s["title"]} : {s["performers"]}' for s in songs])
 
+
+def one_sentence_summary(text):
+    """Condense a summary down to its first sentence when possible."""
+    cleaned = normalize_space(text)
+    if not cleaned:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", cleaned)
+    return parts[0].strip()
+
+
+BLOCK_SEARCH_SCHEMA = {
+    "type": "object",
+    "required": ["selected_block_id", "confidence", "reason"],
+    "properties": {
+        "selected_block_id": {"type": "integer"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+BOUNDARY_SELECTION_SCHEMA = {
+    "type": "object",
+    "required": ["found", "start_candidate_index", "end_candidate_index", "confidence", "reason"],
+    "properties": {
+        "found": {"type": "boolean"},
+        "start_candidate_index": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "end_candidate_index": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "reason": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+LYRICS_WINDOW_SCHEMA = {
+    "type": "object",
+    "required": ["lyrics_cue_ids", "confidence", "reason"],
+    "properties": {
+        "lyrics_cue_ids": {"type": "array", "items": {"type": "integer"}},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "reason": {"type": "string"},
+    },
+    "additionalProperties": False,
+}
+
+CHAPTER_SCHEMA = {
+    "type": "object",
+    "required": ["index", "act", "song_title", "title", "summary", "themes", "characters"],
+    "properties": {
+        "index": {"type": "integer"},
+        "act": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+        "song_title": {"type": "string"},
+        "title": {"type": "string"},
+        "summary": {"type": "string"},
+        "themes": {"type": "array", "items": {"type": "string"}},
+        "characters": {"type": "array", "items": {"type": "string"}},
+        "chapter_title": {"type": "string"},
+        "key_characters": {"type": "array", "items": {"type": "string"}},
+        "key_events": {"type": "array", "items": {"type": "string"}},
+        "continuity_notes": {"type": "array", "items": {"type": "string"}},
+        "story_role": {"type": "string"},
+        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+    },
+    "additionalProperties": False,
+}
+
+FINAL_SUMMARY_SCHEMA = {
+    "type": "object",
+    "required": ["overall_summary", "act_summaries"],
+    "properties": {
+        "overall_summary": {"type": "string"},
+        "act_summaries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["act", "summary"],
+                "properties": {
+                    "act": {"type": "integer"},
+                    "summary": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    "additionalProperties": False,
+}
+
+
+def build_boundary_candidates(cues, blocks):
+    """Build ordered boundary candidates from block starts and long cue gaps."""
+    candidates = []
+    seen = set()
+
+    def add_candidate(cue_id, ms, kind, source_block_id, label):
+        if cue_id in seen:
+            return
+        seen.add(cue_id)
+        candidates.append({
+            "cue_id": cue_id,
+            "ms": ms,
+            "kind": kind,
+            "source_block_id": source_block_id,
+            "label": label,
+        })
+
+    for block in blocks:
+        add_candidate(
+            block["start_cue_id"],
+            block["start_ms"],
+            "block_start",
+            block["block_id"],
+            block.get("excerpt", "")[:120],
+        )
+
+    for i in range(len(cues) - 1):
+        gap_ms = max(0, cues[i + 1]["start_ms"] - cues[i]["end_ms"])
+        if gap_ms >= LONG_GAP_MS:
+            add_candidate(
+                cues[i + 1]["cue_id"],
+                cues[i + 1]["start_ms"],
+                "long_gap",
+                0,
+                f"gap {gap_ms}ms after cue {cues[i]['cue_id']}",
+            )
+
+    if cues:
+        add_candidate(len(cues) + 1, cues[-1]["end_ms"] + 1, "end_of_file", 0, "end of file")
+
+    candidates.sort(key=lambda x: (x["cue_id"], x["ms"]))
+    for idx, candidate in enumerate(candidates, start=1):
+        candidate["candidate_index"] = idx
+    return candidates
+
+
+def format_boundary_candidates(candidates):
+    """Render candidate boundaries for the LLM prompt."""
+    rows = []
+    for c in candidates:
+        rows.append(
+            f'{c["candidate_index"]}. cue_id={c["cue_id"]} ms={ms_to_clock(c["ms"])} kind={c["kind"]} block={c["source_block_id"]} label={c["label"]}'
+        )
+    return "\n".join(rows)
+
+
+def choose_candidate_blocks(blocks, start_block_idx, limit=SEARCH_BLOCKS):
+    """Select a sliding window of candidate blocks."""
+    return blocks[start_block_idx:start_block_idx + limit]
+
+
+def candidate_index_lookup(candidates):
+    """Build a lookup table for candidate indexes."""
+    return {c["candidate_index"]: c for c in candidates}
+
+
+def _sanitize_lyrics_ids(resp, subset, start_cue_id, end_cue_id):
+    """Drop lyric cue IDs that are not present in the supplied window."""
+    valid_ids = {c["cue_id"] for c in subset if start_cue_id <= c["cue_id"] <= end_cue_id}
+    original = list(resp.get("lyrics_cue_ids", []) or [])
+    filtered = []
+    dropped = []
+    seen = set()
+
+    for cue_id in original:
+        if not isinstance(cue_id, int):
+            continue
+        if cue_id not in valid_ids:
+            dropped.append(cue_id)
+            continue
+        if cue_id in seen:
+            continue
+        seen.add(cue_id)
+        filtered.append(cue_id)
+
+    if dropped:
+        print(f"LLM task=lyrics_window dropped_unknown_ids={dropped}")
+    resp["lyrics_cue_ids"] = filtered
+
+
+def shrink_search_blocks(current):
+    """Reduce a search window for an oversized detection prompt."""
+    return max(1, current - max(1, current // 3))
+
+
+def shrink_boundary_context(current):
+    """Reduce boundary context for an oversized detection prompt."""
+    return max(0, current - 1)
+
+
+def shrink_lyrics_window(window_cues, overlap):
+    """Reduce lyric window size and expand overlap proportionally."""
+    reduced_window = max(24, int(window_cues * 0.75))
+    if reduced_window >= window_cues and window_cues > 24:
+        reduced_window = window_cues - 1
+    delta = max(1, window_cues - reduced_window)
+    reduced_overlap = min(reduced_window - 1, max(overlap + delta // 2, overlap))
+    return reduced_window, reduced_overlap
+
 def format_block_summaries(blocks, target_song):
     """Render compact block summaries with title-anchor hints.
 
@@ -1129,7 +2240,7 @@ def cue_rows_for_prompt(cues_subset):
         )
     return "\n".join(rows)
 
-def boundary_refine_prompt(target_song, prev_song, next_song, search_cue_id, cues_subset):
+def boundary_refine_prompt(target_song, prev_song, next_song, search_cue_id, cues_subset, candidates):
     """Build the prompt for precise start/end cue refinement.
 
     Args:
@@ -1159,23 +2270,26 @@ Current search starts at or after cue_id:
 Subtitle cues are TSV with columns:
 cue_id  start  end  dur_s  gap_before_s  gap_after_s  bed_before  bed_after  rms_n  chars_per_sec  text
 
-Context:
+Context cues:
 {cue_rows_for_prompt(cues_subset)}
+
+Boundary candidates (choose by index only):
+{format_boundary_candidates(candidates)}
 
 Return JSON only:
 {{
-  "found": true or false,
-  "song_start_cue_id": integer or null,
-  "song_end_cue_id": integer or null,
-  "confidence": "high|medium|low",
+    "found": true or false,
+    "start_candidate_index": integer or null,
+    "end_candidate_index": integer or null,
+        "confidence": number from 0.0 to 1.0,
   "reason": "brief explanation"
 }}
 
 Rules:
-- song_start_cue_id = earliest cue clearly belonging to the song.
-- song_end_cue_id = latest cue clearly belonging to the song.
+- choose the earliest candidate that clearly marks the start of the song.
+- choose the latest candidate that clearly marks the end of the song.
 - Exclude spoken dialogue before/after the song.
-- If the song is not present here, return found=false.
+- If the song is not present here, return found=false and null candidate indexes.
 - Use the audio hints to separate sung flow from spoken dialogue.
 """
 
@@ -1235,8 +2349,8 @@ def chapter_prompt(flyer_plot_summary, prior_chapters, song_record):
 Global plot summary from flyer:
 {flyer_plot_summary}
 
-Prior chapter continuity:
-{json.dumps(prior_chapters[-3:], ensure_ascii=False, indent=2) if prior_chapters else "[]"}
+Prior chapter continuity, in order:
+{json.dumps(prior_chapters, ensure_ascii=False, indent=2) if prior_chapters else "[]"}
 
 Current song record:
 {json.dumps(song_record, ensure_ascii=False, indent=2)}
@@ -1244,15 +2358,18 @@ Current song record:
 Return JSON only:
 {{
   "index": {song_record["index"]},
-  "act": {song_record["act"] if song_record["act"] is not None else "null"},
+    "act": {song_record["act"] if song_record["act"] is not None else "null"},
   "song_title": {json.dumps(song_record["song_title"])},
-  "chapter_title": "short readable chapter title",
-  "summary": "1-3 paragraph story summary of what happens in this song",
-  "story_role": "setup|decision|conflict|turning point|aftermath|finale",
-  "key_characters": ["names"],
-  "key_events": ["event 1", "event 2"],
-  "continuity_notes": ["important carry-forward facts"],
-  "confidence": "high|medium|low"
+    "title": "short readable chapter title",
+    "summary": "1-3 paragraph story summary of what happens in this song",
+    "themes": ["theme 1", "theme 2"],
+    "characters": ["names"],
+    "chapter_title": "short readable chapter title",
+    "key_characters": ["names"],
+    "key_events": ["event 1", "event 2"],
+    "continuity_notes": ["important carry-forward facts"],
+    "story_role": "setup|decision|conflict|turning point|aftermath|finale",
+    "confidence": "high|medium|low"
 }}
 """
 
@@ -1271,7 +2388,7 @@ def final_assembly_prompt(chapters, flyer_plot_summary):
 Flyer plot summary:
 {flyer_plot_summary}
 
-Song chapters:
+Chapter summaries:
 {json.dumps(chapters, ensure_ascii=False, indent=2)}
 
 Return JSON only:
@@ -1287,79 +2404,146 @@ Return JSON only:
 # =========================
 # Detection pipeline
 # =========================
-def choose_candidate_blocks(blocks, start_block_idx):
-    """Select a sliding window of candidate blocks.
-
-    Args:
-        blocks: Full ordered block list.
-        start_block_idx: Starting block index.
-
-    Returns:
-        Block slice capped by SEARCH_BLOCKS.
-    """
-    return blocks[start_block_idx:start_block_idx + SEARCH_BLOCKS]
-
-def refine_song_in_blocks(cues, blocks, song, prev_song, next_song, selected_block_id, search_cue_id):
-    """Refine selected block context into exact song cue boundaries.
-
-    Args:
-        cues: Full cue list.
-        blocks: Full block list.
-        song: Target song dictionary.
-        prev_song: Previous song dictionary or None.
-        next_song: Next song dictionary or None.
-        selected_block_id: Block chosen by block search.
-        search_cue_id: Earliest cue id allowed.
-
-    Returns:
-        Boundary result dictionary, or None when unresolved.
-    """
+def refine_song_in_blocks(cues, blocks, boundary_candidates, song, prev_song, next_song, selected_block_id, search_cue_id, task_deadline):
+    """Refine selected block context into exact song cue boundaries."""
     block_idx = selected_block_id - 1
-    lo = max(0, block_idx - BOUNDARY_CONTEXT_BLOCKS)
-    hi = min(len(blocks), block_idx + BOUNDARY_CONTEXT_BLOCKS + 1)
+    context_blocks = BOUNDARY_CONTEXT_BLOCKS
 
-    cue_lo = blocks[lo]["start_cue_id"]
-    cue_hi = blocks[hi - 1]["end_cue_id"]
+    while True:
+        lo = max(0, block_idx - context_blocks)
+        hi = min(len(blocks), block_idx + context_blocks + 1)
+        cue_lo = blocks[lo]["start_cue_id"]
+        cue_hi = blocks[hi - 1]["end_cue_id"]
 
-    subset = [c for c in cues if cue_lo <= c["cue_id"] <= cue_hi and c["cue_id"] >= search_cue_id]
-    if not subset:
-        return None
+        subset = [c for c in cues if cue_lo <= c["cue_id"] <= cue_hi and c["cue_id"] >= search_cue_id]
+        candidate_pool = [c for c in boundary_candidates if cue_lo <= c["cue_id"] <= cue_hi + 1 and c["cue_id"] >= search_cue_id]
+        if not subset or not candidate_pool:
+            if context_blocks <= 0:
+                return None
+            context_blocks = shrink_boundary_context(context_blocks)
+            continue
 
-    resp = llm_json(
-        SYSTEM,
-        boundary_refine_prompt(song, prev_song, next_song, search_cue_id, subset)
-    )
+        prompt = boundary_refine_prompt(song, prev_song, next_song, search_cue_id, subset, candidate_pool)
+        prompt_tokens_est = estimate_prompt_tokens(SYSTEM + "\n" + prompt)
+        while prompt_tokens_est > MAX_PROMPT_TOKENS and context_blocks > 0:
+            new_context = shrink_boundary_context(context_blocks)
+            if new_context == context_blocks:
+                break
+            print(f"LLM auto-shrink task=boundary_refine boundary_context_blocks {context_blocks}->{new_context} prompt_tokens_est={prompt_tokens_est}")
+            context_blocks = new_context
+            lo = max(0, block_idx - context_blocks)
+            hi = min(len(blocks), block_idx + context_blocks + 1)
+            cue_lo = blocks[lo]["start_cue_id"]
+            cue_hi = blocks[hi - 1]["end_cue_id"]
+            subset = [c for c in cues if cue_lo <= c["cue_id"] <= cue_hi and c["cue_id"] >= search_cue_id]
+            candidate_pool = [c for c in boundary_candidates if cue_lo <= c["cue_id"] <= cue_hi + 1 and c["cue_id"] >= search_cue_id]
+            prompt = boundary_refine_prompt(song, prev_song, next_song, search_cue_id, subset, candidate_pool)
+            prompt_tokens_est = estimate_prompt_tokens(SYSTEM + "\n" + prompt)
 
-    found = bool(resp.get("found", False))
-    if not found:
-        return None
+        if not subset or not candidate_pool:
+            return None
 
-    start_cue_id = resp.get("song_start_cue_id") if isinstance(resp.get("song_start_cue_id"), int) else None
-    end_cue_id = resp.get("song_end_cue_id") if isinstance(resp.get("song_end_cue_id"), int) else None
-    confidence = (resp.get("confidence") or "low").lower()
-    reason = normalize_space(resp.get("reason") or "")
+        lookup = candidate_index_lookup(candidate_pool)
 
-    valid_ids = {c["cue_id"] for c in subset}
-    if start_cue_id not in valid_ids:
-        start_cue_id = None
-    if end_cue_id not in valid_ids:
-        end_cue_id = None
+        def candidate_validator(resp):
+            if not resp.get("found", False):
+                return
+            start_idx = resp.get("start_candidate_index")
+            end_idx = resp.get("end_candidate_index")
+            if not isinstance(start_idx, int) or not isinstance(end_idx, int):
+                raise LLMResponseValidationError("boundary candidate indexes must be integers")
+            if start_idx not in lookup or end_idx not in lookup:
+                raise LLMResponseValidationError("boundary candidate indexes must come from the supplied set")
 
-    if start_cue_id is None or end_cue_id is None:
-        return None
-    if end_cue_id < start_cue_id:
-        end_cue_id = start_cue_id
-        confidence = downgrade_confidence(confidence)
+        resp = llm_chat_json(
+            "detect",
+            "boundary_refine",
+            SYSTEM,
+            prompt,
+            BOUNDARY_SELECTION_SCHEMA,
+            task_deadline=task_deadline,
+            candidate_validator=candidate_validator,
+        )
 
-    return {
-        "start_cue_id": start_cue_id,
-        "end_cue_id": end_cue_id,
-        "confidence": confidence,
-        "notes": reason,
-        "selected_block_id": selected_block_id,
-    }
+        if not resp.get("found", False):
+            return None
 
-def extract_lyrics_for_song(cues, song, start_cue_id, end_cue_id):
+        start_idx = resp.get("start_candidate_index")
+        end_idx = resp.get("end_candidate_index")
+        if not isinstance(start_idx, int) or not isinstance(end_idx, int):
+            return None
+        if start_idx not in lookup or end_idx not in lookup:
+            return None
+
+        start_candidate = lookup[start_idx]
+        end_candidate = lookup[end_idx]
+        confidence_score = float(resp.get("confidence") or 0.0)
+        confidence_label = confidence_score_to_label(confidence_score)
+
+        if ENABLE_VERIFIER:
+            candidate_indexes = [c["candidate_index"] for c in candidate_pool]
+            edge_choice = start_idx == min(candidate_indexes) or end_idx == max(candidate_indexes)
+            if edge_choice or confidence_score < 0.7:
+                verify_start = max(1, start_idx - TASK_BOUNDARY_NEIGHBORS)
+                verify_end = min(max(candidate_indexes), end_idx + TASK_BOUNDARY_NEIGHBORS)
+                verify_candidates = [c for c in candidate_pool if verify_start <= c["candidate_index"] <= verify_end]
+                if verify_candidates:
+                    verify_lookup = candidate_index_lookup(verify_candidates)
+                    verify_prompt = boundary_refine_prompt(song, prev_song, next_song, search_cue_id, subset, verify_candidates)
+                    verify_prompt += f"\n\nVerification pass: confirm or revise the chosen boundaries. Original choice was start candidate {start_idx} and end candidate {end_idx}."
+
+                    def verify_candidate_validator(resp):
+                        if not resp.get("found", False):
+                            return
+                        verify_start_idx = resp.get("start_candidate_index")
+                        verify_end_idx = resp.get("end_candidate_index")
+                        if verify_start_idx not in verify_lookup or verify_end_idx not in verify_lookup:
+                            raise LLMResponseValidationError("verification indexes must come from the supplied neighborhood")
+
+                    verify_resp = llm_chat_json(
+                        "verify",
+                        "boundary_verify",
+                        SYSTEM,
+                        verify_prompt,
+                        BOUNDARY_SELECTION_SCHEMA,
+                        task_deadline=task_deadline,
+                        candidate_validator=verify_candidate_validator,
+                    )
+                    if verify_resp.get("found", False):
+                        verify_start_idx = verify_resp.get("start_candidate_index")
+                        verify_end_idx = verify_resp.get("end_candidate_index")
+                        if isinstance(verify_start_idx, int) and isinstance(verify_end_idx, int):
+                            if verify_start_idx in lookup and verify_end_idx in lookup:
+                                new_start = lookup[verify_start_idx]
+                                new_end = lookup[verify_end_idx]
+                                start_shift = abs(new_start["ms"] - start_candidate["ms"])
+                                end_shift = abs(new_end["ms"] - end_candidate["ms"])
+                                if start_shift > MIN_BOUNDARY_SHIFT_MS:
+                                    start_candidate = new_start
+                                if end_shift > MIN_BOUNDARY_SHIFT_MS:
+                                    end_candidate = new_end
+                                confidence_score = float(verify_resp.get("confidence") or confidence_score)
+                                confidence_label = confidence_score_to_label(confidence_score)
+
+        start_cue_id = start_candidate["cue_id"]
+        end_cue_id = max(start_cue_id, end_candidate["cue_id"] - 1)
+        confidence = confidence_label
+        reason = normalize_space(resp.get("reason") or "")
+
+        if end_cue_id < start_cue_id:
+            end_cue_id = start_cue_id
+            confidence = downgrade_confidence(confidence)
+
+        return {
+            "start_cue_id": start_cue_id,
+            "end_cue_id": end_cue_id,
+            "confidence": confidence,
+            "notes": reason,
+            "selected_block_id": selected_block_id,
+        }
+
+
+def extract_lyrics_for_song(cues, song, start_cue_id, end_cue_id, task_deadline):
     """Extract lyric cue ids from a bounded song region.
 
     Args:
@@ -1377,32 +2561,68 @@ def extract_lyrics_for_song(cues, song, start_cue_id, end_cue_id):
         return [], "low", "Invalid cue bounds"
 
     lyric_ids = []
+    seen_ids = set()
     confs = []
     reasons = []
 
-    step = max(1, LYRICS_WINDOW_CUES - LYRICS_WINDOW_OVERLAP)
     wstart = start_idx
     while wstart <= end_idx:
-        wend = min(end_idx + 1, wstart + LYRICS_WINDOW_CUES)
-        subset = cues[wstart:wend]
-        resp = llm_json(
+        window_state = {
+            "window_size": LYRICS_WINDOW_CUES,
+            "overlap": LYRICS_WINDOW_OVERLAP,
+            "window_start": wstart,
+        }
+
+        def window_subset(state):
+            window_size = int(state.get("window_size") or LYRICS_WINDOW_CUES)
+            window_start = int(state.get("window_start") or wstart)
+            window_end = min(end_idx + 1, window_start + window_size)
+            return cues[window_start:window_end]
+
+        def window_prompt_builder(state):
+            subset = window_subset(state)
+            return lyrics_window_prompt(song, start_cue_id, end_cue_id, subset)
+
+        prompt = window_prompt_builder(window_state)
+        prompt_tokens_est = estimate_prompt_tokens(SYSTEM + "\n" + prompt)
+        while prompt_tokens_est > MAX_PROMPT_TOKENS and int(window_state["window_size"]) > 24:
+            new_window_cues, new_overlap = shrink_lyrics_window(int(window_state["window_size"]), int(window_state["overlap"]))
+            if new_window_cues == int(window_state["window_size"]) and new_overlap == int(window_state["overlap"]):
+                break
+            print(f"LLM auto-shrink task=lyrics_window window_cues {window_state['window_size']}->{new_window_cues} overlap {window_state['overlap']}->{new_overlap} prompt_tokens_est={prompt_tokens_est}")
+            window_state["window_size"] = new_window_cues
+            window_state["overlap"] = new_overlap
+            prompt = window_prompt_builder(window_state)
+            prompt_tokens_est = estimate_prompt_tokens(SYSTEM + "\n" + prompt)
+
+        resp = llm_chat_json(
+            "extract",
+            "lyrics_window",
             SYSTEM,
-            lyrics_window_prompt(song, start_cue_id, end_cue_id, subset)
+            prompt,
+            LYRICS_WINDOW_SCHEMA,
+            task_deadline=task_deadline,
+            candidate_validator=lambda r, state=window_state: _sanitize_lyrics_ids(r, window_subset(state), start_cue_id, end_cue_id),
+            prompt_builder=window_prompt_builder,
+            call_state=window_state,
         )
 
         ids = resp.get("lyrics_cue_ids") if isinstance(resp, dict) else []
         if isinstance(ids, list):
-            valid = {c["cue_id"] for c in subset}
-            lyric_ids.extend([x for x in ids if isinstance(x, int) and x in valid and start_cue_id <= x <= end_cue_id])
+            for x in ids:
+                if isinstance(x, int) and x not in seen_ids:
+                    seen_ids.add(x)
+                    lyric_ids.append(x)
 
         confs.append((resp.get("confidence") or "low").lower() if isinstance(resp, dict) else "low")
         rr = normalize_space(resp.get("reason") or "") if isinstance(resp, dict) else ""
         if rr:
             reasons.append(rr)
 
-        if wend >= end_idx + 1:
+        current_subset = window_subset(window_state)
+        if current_subset and current_subset[-1]["cue_id"] >= end_idx:
             break
-        wstart += step
+        wstart += max(1, int(window_state["window_size"]) - int(window_state["overlap"]))
 
     lyric_ids = sorted(set(lyric_ids))
 
@@ -1445,11 +2665,13 @@ def detect_songs(cues, blocks, songs, workdir):
     search_cue_id = int(progress.get("search_cue_id", 1))
 
     c_map = cue_map(cues)
+    boundary_candidates = build_boundary_candidates(cues, blocks)
 
     for si in range(next_song_index, len(songs) + 1):
         song = songs[si - 1]
         prev_song = songs[si - 2] if si > 1 else None
         next_song = songs[si] if si < len(songs) else None
+        song_deadline = task_deadline()
 
         print(f"Detecting song {si}/{len(songs)}: {song['title']}")
 
@@ -1460,28 +2682,70 @@ def detect_songs(cues, blocks, songs, workdir):
 
         look_idx = start_block_idx
         while look_idx < len(blocks):
-            candidate_blocks = choose_candidate_blocks(blocks, look_idx)
+            search_state = {"window_size": SEARCH_BLOCKS}
+
+            def search_candidates(state):
+                return choose_candidate_blocks(blocks, look_idx, int(state.get("window_size") or SEARCH_BLOCKS))
+
+            candidate_blocks = search_candidates(search_state)
             if not candidate_blocks:
                 break
 
-            search_resp = llm_json(
-                SYSTEM,
-                block_search_prompt(
+            def search_prompt_builder(state):
+                blocks_subset = search_candidates(state)
+                return block_search_prompt(
                     song,
                     prev_song,
                     songs[si:si + 3],
                     search_cue_id,
-                    candidate_blocks,
-                    songs
+                    blocks_subset,
+                    songs,
                 )
+
+            prompt = search_prompt_builder(search_state)
+            prompt_tokens_est = estimate_prompt_tokens(SYSTEM + "\n" + prompt)
+            while prompt_tokens_est > MAX_PROMPT_TOKENS and int(search_state["window_size"]) > 1:
+                new_search_blocks = shrink_search_blocks(int(search_state["window_size"]))
+                if new_search_blocks == int(search_state["window_size"]):
+                    break
+                print(f"LLM auto-shrink task=song_search search_blocks {search_state['window_size']}->{new_search_blocks} prompt_tokens_est={prompt_tokens_est}")
+                search_state["window_size"] = new_search_blocks
+                candidate_blocks = search_candidates(search_state)
+                if not candidate_blocks:
+                    break
+                prompt = search_prompt_builder(search_state)
+                prompt_tokens_est = estimate_prompt_tokens(SYSTEM + "\n" + prompt)
+
+            if not candidate_blocks:
+                break
+
+            def search_validator(resp):
+                selected = resp.get("selected_block_id")
+                if selected == 0:
+                    return
+                current_lookup = {b["block_id"]: b for b in search_candidates(search_state)}
+                if selected not in current_lookup:
+                    raise LLMResponseValidationError("selected_block_id must come from the supplied candidate blocks")
+
+            search_resp = llm_chat_json(
+                "detect",
+                "song_search",
+                SYSTEM,
+                prompt,
+                BLOCK_SEARCH_SCHEMA,
+                task_deadline=song_deadline,
+                candidate_validator=search_validator,
+                prompt_builder=search_prompt_builder,
+                call_state=search_state,
             )
 
             selected_block_id = search_resp.get("selected_block_id") if isinstance(search_resp.get("selected_block_id"), int) else 0
             block_search_conf = (search_resp.get("confidence") or "low").lower()
             block_search_reason = normalize_space(search_resp.get("reason") or "")
 
-            if selected_block_id and any(b["block_id"] == selected_block_id for b in candidate_blocks):
-                found = refine_song_in_blocks(cues, blocks, song, prev_song, next_song, selected_block_id, search_cue_id)
+            current_lookup = {b["block_id"]: b for b in search_candidates(search_state)}
+            if selected_block_id and selected_block_id in current_lookup:
+                found = refine_song_in_blocks(cues, blocks, boundary_candidates, song, prev_song, next_song, selected_block_id, search_cue_id, song_deadline)
                 if found:
                     break
 
@@ -1490,7 +2754,7 @@ def detect_songs(cues, blocks, songs, workdir):
         # Use a deterministic fallback so processing continues on weak cues.
         if not found:
             # Fallback: choose the best-looking nearby block, low confidence
-            nearby = choose_candidate_blocks(blocks, start_block_idx)
+            nearby = choose_candidate_blocks(blocks, start_block_idx, SEARCH_BLOCKS)
             if nearby:
                 fallback = sorted(nearby, key=lambda b: (-b["song_like_score"], b["block_id"]))[0]
                 found = {
@@ -1510,7 +2774,7 @@ def detect_songs(cues, blocks, songs, workdir):
                 }
 
         lyric_ids, lyric_conf, lyric_reason = extract_lyrics_for_song(
-            cues, song, found["start_cue_id"], found["end_cue_id"]
+                cues, song, found["start_cue_id"], found["end_cue_id"], song_deadline
         )
 
         start_cue = c_map.get(found["start_cue_id"])
@@ -1598,7 +2862,12 @@ def postprocess_results(results, cues):
             end_id = start_id
             conf = downgrade_confidence(conf)
 
-        lyric_ids = [cid for cid in r.get("lyrics_cue_ids", []) if isinstance(cid, int) and start_id <= cid <= end_id and cid in c_map]
+        lyric_ids = []
+        seen_lyric_ids = set()
+        for cid in r.get("lyrics_cue_ids", []):
+            if isinstance(cid, int) and start_id <= cid <= end_id and cid in c_map and cid not in seen_lyric_ids:
+                seen_lyric_ids.add(cid)
+                lyric_ids.append(cid)
         if not lyric_ids:
             lyric_ids = [cid for cid in range(start_id, end_id + 1) if cid in c_map and c_map[cid]["text"]]
 
@@ -1680,8 +2949,15 @@ def write_lyrics_md(results, out_path):
             f.write(f"- **Start:** {r['start_time'] or 'Unknown'}\n")
             f.write(f"- **End:** {r['end_time'] or 'Unknown'}\n")
             f.write(f"- **Confidence:** {r['confidence']}\n\n")
-            if r["lyrics"]:
-                f.write(r["lyrics"].strip() + "\n\n")
+            lyrics_lines = []
+            seen = set()
+            for line in (r.get("lyrics") or "").splitlines():
+                normalized = line.rstrip()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    lyrics_lines.append(normalized)
+            if lyrics_lines:
+                f.write("\n".join(lyrics_lines).strip() + "\n\n")
             else:
                 f.write("[No lyrics extracted]\n\n")
 
@@ -1709,14 +2985,43 @@ def summarize_story(results, flyer_plot_summary, workdir):
 
     chapters = progress.get("chapters", [])
     next_song_index = int(progress.get("next_song_index", 1))
+    narrative_temperature = max(0.2, TEMPERATURE)
+
+    def chapter_context(existing_chapters):
+        context = []
+        for ch in existing_chapters:
+            context.append({
+                "index": ch.get("index"),
+                "title": ch.get("title") or ch.get("chapter_title") or ch.get("song_title"),
+                "summary": one_sentence_summary(ch.get("summary", "")),
+            })
+        return context
+
+    llm_chat_json(
+        "summary",
+        "summary_warmup",
+        SUMMARY_SYSTEM,
+        "Warm up the summary model with one token.",
+        None,
+        task_deadline=task_deadline(),
+        num_predict_override=1,
+        expect_json=False,
+    )
 
     for i in range(next_song_index, len(results) + 1):
         song_record = results[i - 1]
         print(f"Summarizing chapter {i}/{len(results)}: {song_record['song_title']}")
-        resp = llm_json(
+        resp = llm_chat_json(
+            "summary",
+            "chapter_summary",
             SUMMARY_SYSTEM,
-            chapter_prompt(flyer_plot_summary, chapters, song_record)
+            chapter_prompt(flyer_plot_summary, chapter_context(chapters), song_record),
+            CHAPTER_SCHEMA,
+            task_deadline=task_deadline(),
         )
+        resp.setdefault("chapter_title", resp.get("title", ""))
+        resp.setdefault("key_characters", resp.get("characters", []))
+        resp.setdefault("themes", resp.get("themes", []))
         chapters.append(resp)
         save_json(progress_path, {
             "next_song_index": i + 1,
@@ -1725,9 +3030,21 @@ def summarize_story(results, flyer_plot_summary, workdir):
         })
 
     print("Creating overall story summary...")
-    overall = llm_json(
+    overall_context = [
+        {
+            "index": ch.get("index"),
+            "title": ch.get("title") or ch.get("chapter_title") or ch.get("song_title"),
+            "summary": ch.get("summary", ""),
+        }
+        for ch in chapters
+    ]
+    overall = llm_chat_json(
+        "summary",
+        "story_assembly",
         SUMMARY_SYSTEM,
-        final_assembly_prompt(chapters, flyer_plot_summary)
+        final_assembly_prompt(overall_context, flyer_plot_summary),
+        FINAL_SUMMARY_SCHEMA,
+        task_deadline=task_deadline(),
     )
 
     save_json(progress_path, {
@@ -1771,11 +3088,18 @@ def write_story_md(chapters, overall, out_path):
                 current_act = ch["act"]
                 f.write(f"## Act {current_act}\n\n")
 
+            chapter_title = ch.get("title") or ch.get("chapter_title") or ""
+            characters = ch.get("characters") or ch.get("key_characters") or []
+            themes = ch.get("themes") or []
+
             f.write(f"### {ch['index']}. {ch['song_title']}\n\n")
-            f.write(f"- **Chapter title:** {ch.get('chapter_title', '')}\n")
+            f.write(f"- **Chapter title:** {chapter_title}\n")
             f.write(f"- **Story role:** {ch.get('story_role', '')}\n")
             f.write(f"- **Confidence:** {ch.get('confidence', '')}\n")
-            f.write(f"- **Characters:** {', '.join(ch.get('key_characters', []))}\n\n")
+            f.write(f"- **Characters:** {', '.join(characters)}\n")
+            if themes:
+                f.write(f"- **Themes:** {', '.join(themes)}\n")
+            f.write("\n")
             f.write((ch.get("summary") or "").strip() + "\n\n")
 
             events = ch.get("key_events") or []

@@ -26,6 +26,7 @@ Given subtitle cues (`input.srt`), flyer metadata (`flyer.txt`), and source medi
 - `ffmpeg` on `PATH`
 - Python package:
   - `numpy`
+- If you use Docker, the image bundles Python 3.12, `ffmpeg`, and `numpy`, so the host only needs Docker.
 - Reachable OpenAI-compatible chat endpoint
 
 ## Input Files
@@ -48,17 +49,59 @@ Required:
   `http://host:4000/v1`)
 
 Common optional:
-- `MODEL` (default: `qwen3.6:35b-a3b`)
+- `MODEL` (legacy fallback; if set, it overrides the tier defaults below)
+- `MODEL_DETECT` (default: `qwen3-coder:30b`)
+- `MODEL_EXTRACT` (default: `qwen3-coder:30b`)
+- `MODEL_SUMMARY` (default: `qwen3.6:35b-a3b`)
+- `MODEL_VERIFY` (default: `nemotron-cascade-2:30b`)
 - `API_KEY` (default: empty)
 - `TEMPERATURE` (default: `0.2`)
 - `WORKDIR` (default: `/work`)
 - `RESUME` (default: `1`) for checkpoint resume behavior
+- `ENABLE_VERIFIER` (default: `0`) enables the optional boundary verifier pass
+- `REQUEST_TIMEOUT` (default: `180`) per HTTP request timeout in seconds
+- `TASK_TIMEOUT` (default: `1800`) hard wall-clock cap per logical LLM task
+- `MAX_PROMPT_TOKENS` (default: `12000`) prompt budget heuristic for auto-shrinking
+- `MIN_BOUNDARY_SHIFT_MS` (default: `1500`) minimum shift needed to accept a revised boundary
+- `MAX_CONCURRENCY` (default: `1`) reserved concurrency cap; the pipeline stays serialized by default
+
+Request routing and cache controls:
+- `NUM_CTX_DETECT` (default: `16384`) detect-stage context window
+- `NUM_CTX_EXTRACT` (default: `16384`) lyric-extraction context window
+- `NUM_CTX_SUMMARY` (default: `32768`) summary-stage context window
+- `NUM_CTX_VERIFY` (default: `16384`) verifier context window
+- `NUM_CTX_HARD_CAP` (default: `32768`) absolute cap used by empty-response repairs when they need more context
+- `NUM_PREDICT_DETECT` (default: `512`) detect-stage output budget
+- `NUM_PREDICT_EXTRACT` (default: `2048`) lyric-extraction output budget
+- `NUM_PREDICT_SUMMARY` (default: `8192`) summary-stage output budget
+- `NUM_PREDICT_VERIFY` (default: `4096`) verifier output budget
+- `KV_CACHE_TYPE` (default: `q8_0`) forwarded to both KV cache slots in the request options
+- `THINK_DETECT` (default: `0`) disables thinking for detect calls when set to `0`
+- `THINK_EXTRACT` (default: `0`) disables thinking for extract calls when set to `0`
+- `THINK_SUMMARY` (default: `1`) enables thinking for summary calls by default
+- `THINK_VERIFY` (default: `1`) enables thinking for verifier calls by default
 
 Retry and error handling:
 - `MAX_RETRIES` (default: `8`)
 - `BASE_SLEEP` (default: `2.0`)
 - `MAX_SLEEP` (default: `45.0`)
 - `ERR_BODY_CHARS` (default: `6000`)
+- `EMPTY_REPAIR_MAX_STEPS` (default: `3`) bounded empty-response repair attempts before escalation
+- `NUM_PREDICT_HARD_CAP` (default: `16384`) absolute ceiling used by the empty-response repair ladder
+- `LOG_RAW_EMPTY` (default: `0`) set to `1` to log the first 1000 raw response characters on final empty-response failure
+
+### Empty-response handling
+
+Thinking-mode models can sometimes spend their full output budget on hidden reasoning and return HTTP 200 with an empty or whitespace-only `choices[0].message.content`. That is classified as `LLMEmptyResponseError`, not as a transport problem.
+
+The centralized helper now uses a repair ladder instead of retrying the same prompt unchanged:
+1. Double `num_predict` up to `NUM_PREDICT_HARD_CAP`.
+2. Double it again and force `X-Ollama-Think: false` for that one call.
+3. Force `X-Ollama-Think: false` again and prepend `Respond with JSON ONLY. Do NOT think. Do NOT explain. Output must match this schema: <schema>` using the schema already sent in `response_format`.
+
+If the empty response still persists after the configured `EMPTY_REPAIR_MAX_STEPS`, the helper raises a single `LLMEmptyResponseError` to the caller without falling back into the generic retry loop. When the repair ladder needs more room, it can raise `num_ctx` to keep `num_predict <= num_ctx - prompt_tokens_est - 256`, up to `NUM_CTX_HARD_CAP`.
+
+Intermittent verifier failures with `http_status:200` and `Empty model response` usually mean thinking-token budget exhaustion. The repair ladder fixes that automatically.
 
 Audio and segmentation tuning:
 - `AUDIO_SR` (default: `16000`)
@@ -74,6 +117,21 @@ Audio and segmentation tuning:
 - `LYRICS_WINDOW_CUES` (default: `90`)
 - `LYRICS_WINDOW_OVERLAP` (default: `15`)
 
+## Model Routing
+
+The pipeline now routes each phase to its own model by default:
+- Detect/boundary selection uses `MODEL_DETECT`.
+- Lyric extraction uses `MODEL_EXTRACT`.
+- Chapter summaries and the final story summary use `MODEL_SUMMARY`.
+- Optional boundary verification uses `MODEL_VERIFY` when `ENABLE_VERIFIER=1`.
+
+The run order is fixed:
+1. Detect and extract are completed first for all songs.
+2. A one-token warmup call is sent to the summary model.
+3. Chapter summaries and the overall summary run after warmup.
+
+If `MODEL` is set, it acts as a legacy fallback for all four tier-specific model variables.
+
 ## Local Run
 
 Install dependencies:
@@ -87,7 +145,12 @@ Run from the `work` folder:
 
 ```bash
 export BASE_URL="http://<your-server>:4000/v1"
-export MODEL="qwen3.6:35b-a3b"
+export MODEL_DETECT="qwen3-coder:30b"
+export MODEL_EXTRACT="qwen3-coder:30b"
+export MODEL_SUMMARY="qwen3.6:35b-a3b"
+# Optional verifier:
+# export MODEL_VERIFY="nemotron-cascade-2:30b"
+# export ENABLE_VERIFIER=1
 # export API_KEY="..."  # if required by your endpoint
 python convert.py
 ```
@@ -105,13 +168,31 @@ Run (mount current folder as `/work`):
 ```bash
 docker run --rm \
   -e BASE_URL="http://host.docker.internal:4000/v1" \
-  -e MODEL="qwen3.6:35b-a3b" \
+  -e MODEL_DETECT="qwen3-coder:30b" \
+  -e MODEL_EXTRACT="qwen3-coder:30b" \
+  -e MODEL_SUMMARY="qwen3.6:35b-a3b" \
   -v "$PWD":/work \
   subtitle-to-story
 ```
 
 On Linux, if `host.docker.internal` is unavailable, replace it with a reachable
 host IP for your LLM endpoint.
+
+Docker run with optional verifier and resume:
+
+```bash
+docker run --rm \
+  -e BASE_URL="http://<orin>:4000/v1" \
+  -e MODEL_DETECT="qwen3-coder:30b" \
+  -e MODEL_EXTRACT="qwen3-coder:30b" \
+  -e MODEL_SUMMARY="qwen3.6:35b-a3b" \
+  -e MODEL_VERIFY="nemotron-cascade-2:30b" \
+  -e ENABLE_VERIFIER=1 \
+  -e KV_CACHE_TYPE=q8_0 \
+  -e RESUME=1 \
+  -v "$PWD":/work \
+  subtitle-to-story
+```
 
 ## Outputs
 
@@ -128,6 +209,38 @@ Progress/checkpoint files:
 
 - `enhanced_progress.json`: song detection progress
 - `song_summary_progress.json`: chapter-summary progress
+
+## Manual Test
+
+Suggested development smoke test from the local Python environment:
+
+```bash
+RESUME=1 \
+BASE_URL=http://<orin>:4000/v1 \
+MODEL_DETECT=qwen3-coder:30b \
+MODEL_EXTRACT=qwen3-coder:30b \
+MODEL_SUMMARY=qwen3.6:35b-a3b \
+MODEL_VERIFY=nemotron-cascade-2:30b \
+ENABLE_VERIFIER=1 \
+KV_CACHE_TYPE=q8_0 \
+python convert.py
+```
+
+Docker form:
+
+```bash
+docker run --rm \
+  -e BASE_URL="http://<orin>:4000/v1" \
+  -e MODEL_DETECT="qwen3-coder:30b" \
+  -e MODEL_EXTRACT="qwen3-coder:30b" \
+  -e MODEL_SUMMARY="qwen3.6:35b-a3b" \
+  -e MODEL_VERIFY="nemotron-cascade-2:30b" \
+  -e ENABLE_VERIFIER=1 \
+  -e KV_CACHE_TYPE=q8_0 \
+  -e RESUME=1 \
+  -v "$PWD":/work \
+  subtitle-to-story
+```
 
 ## Notes
 

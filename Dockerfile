@@ -1,19 +1,28 @@
 FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    WORKDIR=/work
 
-# ffmpeg is required by convert.py when extracting audio from input media.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Runtime Python dependency for audio/block computations.
-RUN pip install --no-cache-dir numpy
+RUN pip install --no-cache-dir --upgrade pip
 
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && rm -f /tmp/requirements.txt
+
+RUN useradd --create-home --uid 1000 app \
+    && mkdir -p /app /work \
+    && chown -R app:app /app /work
+
+COPY convert.py /app/convert.py
+
+VOLUME ["/work"]
 WORKDIR /work
 
-# Keep defaults overridable via -e flags.
-ENV CHUNK_CHARS=12000
+USER app
 
-CMD ["python", "/work/convert.py"]
+ENTRYPOINT ["python", "/app/convert.py"]
