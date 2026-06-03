@@ -6,7 +6,7 @@ This project processes a musical production's subtitle file and flyer text to:
 - produce review artifacts,
 - generate song-by-song story chapters and an overall summary using an LLM API.
 
-The main entry point is `convert.py`.
+The primary entry points are `python -m autoai_musical_play_video_chapters` and the `MusicalPlayVideoChapters` console script.
 
 ## What It Does
 
@@ -49,7 +49,7 @@ Required:
   `http://host:4000/v1`)
 
 Common optional:
-- `MODEL` (legacy fallback; if set, it overrides the tier defaults below)
+- `MODEL` (global fallback; if set, it overrides the tier defaults below)
 - `MODEL_DETECT` (default: `qwen3-coder:30b`)
 - `MODEL_EXTRACT` (default: `qwen3-coder:30b`)
 - `MODEL_SUMMARY` (default: `qwen3.6:35b-a3b`)
@@ -87,6 +87,9 @@ Retry and error handling:
 - `MAX_SLEEP` (default: `45.0`)
 - `ERR_BODY_CHARS` (default: `6000`)
 - `EMPTY_REPAIR_MAX_STEPS` (default: `3`) bounded empty-response repair attempts before escalation
+- `VALIDATION_REPAIR_MAX_STEPS` (default: `3`) bounded validation-error repair attempts for enum-constrained index calls
+- `BOUNDARY_REFINE_FALLBACK_WINDOW` (default: `5`) candidate count on each side of the anchor for step-3 boundary refinement shrinking
+- `STRICT_BOUNDARIES` (default: `0`) when set to `1`, disables degraded boundary fallback and aborts on exhausted validation repair
 - `NUM_PREDICT_HARD_CAP` (default: `16384`) absolute ceiling used by the empty-response repair ladder
 - `LOG_RAW_EMPTY` (default: `0`) set to `1` to log the first 1000 raw response characters on final empty-response failure
 
@@ -102,6 +105,24 @@ The centralized helper now uses a repair ladder instead of retrying the same pro
 If the empty response still persists after the configured `EMPTY_REPAIR_MAX_STEPS`, the helper raises a single `LLMEmptyResponseError` to the caller without falling back into the generic retry loop. When the repair ladder needs more room, it can raise `num_ctx` to keep `num_predict <= num_ctx - prompt_tokens_est - 256`, up to `NUM_CTX_HARD_CAP`.
 
 Intermittent verifier failures with `http_status:200` and `Empty model response` usually mean thinking-token budget exhaustion. The repair ladder fixes that automatically.
+
+### Validation-error handling
+
+Boundary and index-selection calls now send strict enum-backed schemas (for example, `selected_block_id` and boundary candidate indexes are constrained with explicit integer `enum` lists). This pushes out-of-set rejection into the upstream decoder instead of relying on prompt prose or client-side min/max checks.
+
+When a 2xx response is parseable JSON but fails candidate/schema validation (`LLMResponseValidationError`), the centralized helper runs a dedicated repair ladder and does not use the generic retry loop for that error class:
+1. Re-issue with a repair message that includes the model's prior value and the exact allowed enum set.
+2. Retry once with `X-Ollama-Think: true` and a larger `num_predict` budget.
+3. For boundary refinement/verification, shrink candidates to a tight anchor window (`BOUNDARY_REFINE_FALLBACK_WINDOW`) and rebuild the enum schema before retry.
+
+If the validation ladder is exhausted for a song boundary refine call and `STRICT_BOUNDARIES=0`, the run degrades gracefully instead of aborting:
+- the song gets deterministic fallback boundaries,
+- `songs.json` adds optional fields `degraded: true` and `degradation_reason`,
+- processing continues with the next song.
+
+Set `STRICT_BOUNDARIES=1` for CI or strict batch runs where any exhausted validation repair must fail loud.
+
+Intermittent `LLMResponseValidationError` failures with `http_status:200` and long candidate lists usually mean the model lost track of the allowed range. Enum schema hardening fixes this at the source; the validation ladder is the safety net.
 
 Audio and segmentation tuning:
 - `AUDIO_SR` (default: `16000`)
@@ -130,7 +151,7 @@ The run order is fixed:
 2. A one-token warmup call is sent to the summary model.
 3. Chapter summaries and the overall summary run after warmup.
 
-If `MODEL` is set, it acts as a legacy fallback for all four tier-specific model variables.
+If `MODEL` is set, it acts as a global fallback for all four tier-specific model variables.
 
 ## Local Run
 
@@ -152,7 +173,20 @@ export MODEL_SUMMARY="qwen3.6:35b-a3b"
 # export MODEL_VERIFY="nemotron-cascade-2:30b"
 # export ENABLE_VERIFIER=1
 # export API_KEY="..."  # if required by your endpoint
-python convert.py
+python -m autoai_musical_play_video_chapters
+```
+
+For a short usage summary:
+
+```bash
+python -m autoai_musical_play_video_chapters --help
+```
+
+If the console script is installed, this works too:
+
+```bash
+MusicalPlayVideoChapters
+```
 ```
 
 ## Docker Run
@@ -205,6 +239,10 @@ Main outputs in `WORKDIR`:
 - `song_story_summary.json`: chapter summaries and overall story summary
 - `song_story_summary.md`: Markdown rendering of story summary
 
+Optional per-song detection fields:
+- `degraded` (boolean): present and `true` when boundary refinement exhausted validation repair and a deterministic fallback choice was used.
+- `degradation_reason` (string): short reason/source for the degraded fallback decision.
+
 Progress/checkpoint files:
 
 - `enhanced_progress.json`: song detection progress
@@ -223,7 +261,7 @@ MODEL_SUMMARY=qwen3.6:35b-a3b \
 MODEL_VERIFY=nemotron-cascade-2:30b \
 ENABLE_VERIFIER=1 \
 KV_CACHE_TYPE=q8_0 \
-python convert.py
+python -m autoai_musical_play_video_chapters
 ```
 
 Docker form:
