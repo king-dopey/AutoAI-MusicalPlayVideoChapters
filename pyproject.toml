@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "AutoAI-MusicalPlayVideoChapters"
+version = "0.1.0"
+description = "Subtitle-to-story pipeline for musical play chapter generation"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "David Heaps", email = "king.dopey.10111@gmail.com" }
+]
+dependencies = [
+  "numpy"
+]
+
+[project.scripts]
+MusicalPlayVideoChapters = "autoai_musical_play_video_chapters.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+autoai_musical_play_video_chapters = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88

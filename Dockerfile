@@ -10,19 +10,23 @@ RUN apt-get update \
 
 RUN pip install --no-cache-dir --upgrade pip
 
-COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir -r /tmp/requirements.txt \
-    && rm -f /tmp/requirements.txt
+# Copy project metadata and sources into image for installation
+COPY pyproject.toml README.md LICENSE requirements.txt /tmp/project/
+COPY src /tmp/project/src
+
+# Install declared dependencies (numpy) and the package itself
+RUN pip install --no-cache-dir -r /tmp/project/requirements.txt \
+    && pip install --no-cache-dir /tmp/project \
+    && rm -rf /tmp/project
 
 RUN useradd --create-home --uid 1000 app \
     && mkdir -p /app /work \
     && chown -R app:app /app /work
-
-COPY convert.py /app/convert.py
 
 VOLUME ["/work"]
 WORKDIR /work
 
 USER app
 
-ENTRYPOINT ["python", "/app/convert.py"]
+# Invoke the package as the canonical entrypoint
+ENTRYPOINT ["python", "-m", "autoai_musical_play_video_chapters"]
